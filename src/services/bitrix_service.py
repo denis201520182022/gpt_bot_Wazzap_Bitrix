@@ -1,6 +1,7 @@
 # src/services/bitrix_service.py
 import requests
 import os
+from datetime import datetime, timedelta
 
 # Получаем базовый URL вебхука из переменных окружения
 BASE_URL = os.getenv("BITRIX_WEBHOOK_URL")
@@ -113,4 +114,79 @@ def get_user_details(user_id: int):
             
     except requests.exceptions.RequestException as e:
         print(f"Ошибка при запросе пользователя {user_id}: {e}")
+        return None
+    
+
+def get_latest_activity_for_deal(deal_id: int):
+    """
+    Получает самое последнее дело (активность), связанное со сделкой.
+    """
+    if not BASE_URL: return None
+    method_url = f"{BASE_URL}crm.activity.list.json"
+    
+    params = {
+        'order': { "ID": "DESC" },  # Сортируем по ID по убыванию, чтобы самое новое было первым
+        'filter': {
+            "OWNER_TYPE_ID": 2,     # 2 - это системный ID для "Сделки"
+            "OWNER_ID": deal_id     # Ищем дела, привязанные к нашей сделке
+        },
+        'select': ["ID", "DESCRIPTION"] # Нам нужно только описание
+    }
+
+    try:
+        response = requests.post(method_url, json=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        # API возвращает список, нам нужен только первый (самый новый) элемент
+        if 'result' in data and data['result']:
+            return data['result'][0]
+        else:
+            print(f"ПРЕДУПРЕЖДЕНИЕ: Для сделки {deal_id} не найдено связанных дел/активностей.")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Ошибка при запросе дел для сделки {deal_id}: {e}")
+        return None
+ def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, description: str):
+    """
+    Создает новое универсальное дело (crm.activity.todo.add), привязанное к сделке.
+    Возвращает ID созданного дела или None в случае ошибки.
+    """
+    if not BASE_URL: return None
+    method_url = f"{BASE_URL}crm.activity.todo.add.json"
+    
+    deadline_time = (datetime.now() + timedelta(hours=3)).strftime('%Y-%m-%dT23:59:59')
+    
+    # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: Убираем вложенность 'fields' ---
+    # Все параметры теперь находятся на одном уровне
+    params = {
+        "ownerTypeId": 2,
+        "ownerId": deal_id,
+        "responsibleId": responsible_id,
+        "deadline": deadline_time,
+        "title": subject,
+        "description": description,
+    }
+
+    try:
+        response = requests.post(method_url, json=params)
+        data = response.json()
+        
+        print(f"ОТЛАДКА: Отправлены параметры: {params}")
+        print(f"ОТЛАДКА: Получен ответ от todo.add: {data}")
+
+        # Ответ от этого метода немного отличается, ID лежит глубже
+        if 'result' in data and data['result'].get('activity'):
+            created_id = data['result']['activity']['ID']
+            print(f"✅ Успешно создано универсальное дело с ID: {created_id} для сделки {deal_id}")
+            return created_id
+        else:
+            # Пытаемся получить более детальную ошибку
+            error_detail = data.get('error_description') or data.get('error')
+            print(f"⚠️ Не удалось создать дело. Ошибка: {error_detail}")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка при создании дела для сделки {deal_id}: {e}")
         return None
