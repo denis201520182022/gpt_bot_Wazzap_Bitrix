@@ -11,3 +11,6 @@ __pycache__/
 # IDE files
 .idea/
 .vscode/
+
+# ... (все предыдущие строки)
+credentials.json

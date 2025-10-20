@@ -75,13 +75,23 @@ def get_deal_details(deal_id: int):
 # src/services/bitrix_service.py
 # ... (вставьте этот код после функции get_deal_details)
 
+# src/services/bitrix_service.py
+
+# src/services/bitrix_service.py
+
 def get_contact_details(contact_id: int):
     """
     Получает детальную информацию о контакте по его ID.
+    Целенаправленно запрашивает имя и телефон.
     """
     if not BASE_URL: return None
     method_url = f"{BASE_URL}crm.contact.get.json"
-    params = {'id': contact_id}
+    
+    params = {
+        'id': contact_id,
+        'select': ["NAME", "PHONE"] # Явно запрашиваем только нужные поля
+    }
+    
     try:
         response = requests.post(method_url, json=params)
         response.raise_for_status()
@@ -90,7 +100,6 @@ def get_contact_details(contact_id: int):
     except requests.exceptions.RequestException as e:
         print(f"Ошибка при запросе контакта {contact_id}: {e}")
         return None
-# src/services/bitrix_service.py
 
 def get_user_details(user_id: int):
     """
@@ -148,7 +157,10 @@ def get_latest_activity_for_deal(deal_id: int):
     except requests.exceptions.RequestException as e:
         print(f"Ошибка при запросе дел для сделки {deal_id}: {e}")
         return None
- def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, description: str):
+    
+# src/services/bitrix_service.py
+
+def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, description: str):
     """
     Создает новое универсальное дело (crm.activity.todo.add), привязанное к сделке.
     Возвращает ID созданного дела или None в случае ошибки.

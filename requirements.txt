@@ -9,3 +9,8 @@ SQLAlchemy
 Uvicorn
 FastAPI
 python-multipart
+openai 
+httpx
+google-api-python-client 
+google-auth-httplib2 
+google-auth-oauthlib
