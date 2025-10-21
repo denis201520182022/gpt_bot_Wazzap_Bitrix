@@ -159,6 +159,7 @@ def get_latest_activity_for_deal(deal_id: int):
         return None
     
 # src/services/bitrix_service.py
+# src/services/bitrix_service.py
 
 def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, description: str):
     """
@@ -170,8 +171,6 @@ def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, de
     
     deadline_time = (datetime.now() + timedelta(hours=3)).strftime('%Y-%m-%dT23:59:59')
     
-    # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: Убираем вложенность 'fields' ---
-    # Все параметры теперь находятся на одном уровне
     params = {
         "ownerTypeId": 2,
         "ownerId": deal_id,
@@ -185,16 +184,14 @@ def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, de
         response = requests.post(method_url, json=params)
         data = response.json()
         
-        print(f"ОТЛАДКА: Отправлены параметры: {params}")
-        print(f"ОТЛАДКА: Получен ответ от todo.add: {data}")
-
-        # Ответ от этого метода немного отличается, ID лежит глубже
-        if 'result' in data and data['result'].get('activity'):
-            created_id = data['result']['activity']['ID']
+        # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+        # Правильно извлекаем ID из ответа {'result': {'id': ...}}
+        if 'result' in data and data['result'].get('id'):
+            created_id = data['result']['id']
             print(f"✅ Успешно создано универсальное дело с ID: {created_id} для сделки {deal_id}")
-            return created_id
+            return created_id # <-- Возвращаем ID, а не None
+        # ------------------------------------
         else:
-            # Пытаемся получить более детальную ошибку
             error_detail = data.get('error_description') or data.get('error')
             print(f"⚠️ Не удалось создать дело. Ошибка: {error_detail}")
             return None
@@ -202,3 +199,84 @@ def create_activity_for_deal(deal_id: int, responsible_id: int, subject: str, de
     except requests.exceptions.RequestException as e:
         print(f"❌ Ошибка при создании дела для сделки {deal_id}: {e}")
         return None
+
+# src/services/bitrix_service.py
+# ... (весь ваш существующий код до этого места)
+
+def add_comment_to_deal(deal_id: int, comment_text: str) -> bool:
+    """
+    Добавляет комментарий в таймлайн сделки.
+    Используется для логирования действий бота.
+    """
+    if not BASE_URL: return False
+    method_url = f"{BASE_URL}crm.timeline.comment.add.json"
+    params = {
+        'fields': {
+            "ENTITY_ID": deal_id,
+            "ENTITY_TYPE": "deal",
+            "COMMENT": comment_text
+        }
+    }
+    try:
+        response = requests.post(method_url, json=params)
+        response.raise_for_status()
+        print(f"✅ Комментарий успешно добавлен к сделке {deal_id}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка при добавлении комментария к сделке {deal_id}: {e}")
+        return False
+
+def move_deal_to_stage(deal_id: int, stage_id: str) -> bool:
+    """
+    Перемещает сделку на указанную стадию.
+    """
+    if not BASE_URL: return False
+    method_url = f"{BASE_URL}crm.deal.update.json"
+    params = {
+        'id': deal_id,
+        'fields': {
+            "STAGE_ID": stage_id
+        }
+    }
+    try:
+        response = requests.post(method_url, json=params)
+        response.raise_for_status()
+        print(f"✅ Сделка {deal_id} успешно перемещена на стадию {stage_id}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка при перемещении сделки {deal_id}: {e}")
+        return False
+
+def escalate_deal_to_manager(deal_id: int, manager_id: int, reason: str):
+    """
+    Выполняет полную процедуру эскалации:
+    1. Создает дело для менеджера с причиной.
+    2. Перемещает сделку на стадию 'Касание сегодня'.
+    """
+    print(f"--- НАЧАЛО ПРОЦЕДУРЫ ЭСКАЛАЦИИ для сделки {deal_id} ---")
+    
+    # 1. Формируем и создаем дело
+    subject = f"Эскалация от чат-бота: Сделка №{deal_id}"
+    description = (f"Требуется внимание менеджера.\n"
+                   f"Причина эскалации: {reason}")
+    
+    activity_created = create_activity_for_deal(
+        deal_id=deal_id,
+        responsible_id=manager_id,
+        subject=subject,
+        description=description
+    )
+
+    if not activity_created:
+        print("   - ❗️ Не удалось создать дело для эскалации.")
+        # Можно добавить логику уведомления администратора
+        return
+
+    # 2. Перемещаем сделку (ID стадии берем из .env)
+    escalation_stage_id = os.getenv("TOUCH_TODAY_STAGE_ID")
+    if escalation_stage_id:
+        move_deal_to_stage(deal_id, escalation_stage_id)
+    else:
+        print("   - ❗️ Не удалось переместить сделку: переменная TOUCH_TODAY_STAGE_ID не найдена в .env")
+
+    print(f"--- ПРОЦЕДУРА ЭСКАЛАЦИИ ЗАВЕРШЕНА ---")

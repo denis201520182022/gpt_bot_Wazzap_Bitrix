@@ -16,7 +16,7 @@ NEW_LOT_STAGE_ID = os.getenv("NEW_LOT_STAGE_ID")
 # --- НОВАЯ ПЕРЕМЕННАЯ ---
 NOMINALS_STAGE_ID = os.getenv("NOMINALS_STAGE_ID") # ID стадии для исключения
 TEST_ACTIVITY_STAGE_ID = os.getenv("TEST_ACTIVITY_STAGE_ID")
-
+TEST_FULL_ACTION_STAGE_ID = os.getenv("TEST_FULL_ACTION_STAGE_ID")
 
 app = FastAPI(title="Bitrix Wazzup Bot")
 
@@ -115,6 +115,28 @@ async def handle_bitrix_webhook(request: Request):
                 bitrix_service.create_activity_for_deal(deal_id=deal_id, responsible_id=manager_id, subject=subject, description=description)
             else:
                 print("ОШИБКА: Не удалось создать дело, т.к. у сделки нет ответственного менеджера.")
+
+        elif current_stage == TEST_FULL_ACTION_STAGE_ID:
+            scenario_name = "КОМПЛЕКСНЫЙ ТЕСТ"
+            reason_for_escalation = "Клиент задал сложный вопрос о юридических аспектах."
+        
+            print_formatted_message(scenario_name, deal_id, client_name, manager_name, "Запускаем проверку всех новых функций...")
+
+            # 1. Тестируем добавление комментария
+            bitrix_service.add_comment_to_deal(
+                deal_id, 
+                f"Тестовый комментарий от бота. Триггер: {scenario_name}."
+            )
+
+            # 2. Тестируем полную процедуру эскалации
+            if manager_id:
+                bitrix_service.escalate_deal_to_manager(
+                    deal_id, 
+                    manager_id, 
+                    reason_for_escalation
+                )
+            else:
+                print("Эскалация невозможна: не найден ID менеджера.")
 
         # --- ЕДИНЫЙ БЛОК ОТПРАВКИ СООБЩЕНИЯ ---
         # Если для сценария было сформировано сообщение, отправляем его
