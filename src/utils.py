@@ -1,5 +1,6 @@
 # src/utils.py
 from starlette.datastructures import FormData
+import re
 
 def parse_form_data(data: FormData) -> dict:
     """
@@ -22,3 +23,10 @@ def parse_form_data(data: FormData) -> dict:
         d[parts[-1]] = value
         
     return parsed_dict
+
+def normalize_phone(phone_number: str) -> str:
+
+    if not phone_number:
+        return ""
+# re.sub(r'\D', '', ...) находит все не-цифры (\D) и заменяет их на пустую строку
+    return re.sub(r'\D', '', phone_number)

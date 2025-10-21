@@ -1,14 +1,12 @@
 # alembic/env.py
 import sys
 import os
-
-# --- ВСТАВЬТЕ ЭТОТ КОД В САМОЕ НАЧАЛО ФАЙЛА ---
-# Добавляем корневую директорию проекта в путь поиска модулей
+from dotenv import load_dotenv
+# Добавляем корневую директорию проекта (где лежит alembic.ini) в путь Python
 sys.path.insert(0, os.path.realpath(os.path.join(os.path.dirname(__file__), '..')))
-# ----------------------------------------------------
 
+load_dotenv()
 from logging.config import fileConfig
-# ... (остальной код)
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
@@ -30,9 +28,8 @@ if config.config_file_name is not None:
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
 from src.database.models import Base
-# ---------------------------------------------------
-
 target_metadata = Base.metadata
+
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")

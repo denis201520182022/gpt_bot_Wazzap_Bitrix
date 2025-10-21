@@ -65,35 +65,32 @@ async def get_llm_response(prompt: str) -> str | None:
         print(f"❌ Ошибка при обращении к OpenAI API: {e}")
         return None
     
-async def generate_manager_response(client_message: str, manager_name: str) -> str | None:
+async def generate_manager_response(conversation_history: list, manager_name: str) -> str | None:
     """
-    Генерирует осмысленный ответ на сообщение клиента от лица менеджера,
-    используя промпты из Google Docs.
+    Генерирует осмысленный ответ, ИСПОЛЬЗУЯ ВСЮ ИСТОРИЮ ДИАЛОГА.
     """
     if not client:
         return None
 
-    # --- ИНТЕГРАЦИЯ: ПОЛУЧАЕМ ДИНАМИЧЕСКИЙ ПРОМПТ ---
     prompt_library = prompt_service.get_prompt_library()
-    # Получаем "роль" из библиотеки. Если ее там нет, используем безопасное значение по умолчанию.
     system_prompt_template = prompt_library.get(
         "#ROLE_AND_STYLE#", 
         "Ты — {manager_name}, менеджер по сопровождению. Отвечай вежливо и по делу."
     )
-    # Персонализируем промпт, подставляя реальное имя менеджера
     system_prompt = system_prompt_template.format(manager_name=manager_name)
+
+    # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: ФОРМИРУЕМ ПОЛНЫЙ КОНТЕКСТ ---
+    # Мы берем системный промпт и добавляем к нему ВСЮ историю переписки.
+    messages_for_llm = [
+        {"role": "system", "content": system_prompt}
+    ] + conversation_history
     # --------------------------------------------------
 
-    dialog_history = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": client_message}
-    ]
-
     try:
-        print(f"Генерация ответа LLM на сообщение: '{client_message[:50]}...'")
+        print(f"Генерация ответа LLM с использованием {len(messages_for_llm)} сообщений в контексте...")
         response = await client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=dialog_history,
+            messages=messages_for_llm,
             temperature=0.7
         )
         
