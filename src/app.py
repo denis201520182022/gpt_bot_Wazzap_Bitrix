@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 import asyncio
+import json
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Depends
@@ -10,59 +11,120 @@ from sqlalchemy.orm import Session
 
 from database import db_service
 from database.db import SessionLocal
-from services import bitrix_service, wazzup_service, llm_service
+from services import bitrix_service, wazzup_service, llm_service, prompt_service
 from utils import parse_form_data, normalize_phone
 
 # --- ЗАГРУЗКА НАСТРОЕК ИЗ .ENV ---
-TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID")
-WELCOME_STAGE_ID = f"C{TARGET_FUNNEL_ID}:NEW"
-TOUCH_TODAY_STAGE_ID = os.getenv("TOUCH_TODAY_STAGE_ID")
-NEW_LOT_STAGE_ID = os.getenv("NEW_LOT_STAGE_ID")
-NOMINALS_STAGE_ID = os.getenv("NOMINALS_STAGE_ID")
-TEST_ACTIVITY_STAGE_ID = os.getenv("TEST_ACTIVITY_STAGE_ID")
-TEST_FULL_ACTION_STAGE_ID = os.getenv("TEST_FULL_ACTION_STAGE_ID")
+# ID воронки "Постоянные" (согласно вашему .env)
+TARGET_FUNNEL_ID = os.getenv("TARGET_FUNNEL_ID") 
+# Первая стадия в этой воронке, которая будет триггером
+WELCOME_STAGE_ID = f"C{TARGET_FUNNEL_ID}:NEW" 
 
-# --- ФОНОВЫЙ ПРОЦЕСС (WORKER) ---
 async def process_pending_messages_worker():
-    print("🚀 Воркер обработки сообщений запущен!")
+    print("🚀 Воркер-ДИСПЕТЧЕР запущен!")
     while True:
         try:
             db = SessionLocal()
-            dialog_batches = db_service.get_and_clear_pending_dialogs(db, delay_seconds=10)
+            # Забираем из БД диалоги, которые ждут обработки
+            dialog_batches = db_service.get_and_clear_pending_dialogs(db, delay_seconds=5)
+            
             for batch in dialog_batches:
                 dialog = batch['dialog']
-                pending = batch['pending']
-                print(f"Обработка {len(pending)} сообщений для chat_id: {dialog.chat_id}")
+                pending_messages = batch['pending']
                 
-                # Сохраняем все сообщения из пачки в основную историю
-                for msg in pending:
-                    db_service.add_message_to_history(db, dialog.chat_id, "user", msg['content'])
+                # Проверяем, не находится ли диалог в "замороженном" состоянии
+                if dialog.current_state == 'escalated':
+                    print(f"Диалог {dialog.chat_id} находится в состоянии 'escalated'. Обработка прекращена.")
+                    continue
 
-                # Получаем всю историю для контекста
-                full_history = db_service.get_dialog_history(db, dialog.chat_id)
+                print(f"Обработка {len(pending_messages)} сообщений для chat_id: {dialog.chat_id} в состоянии '{dialog.current_state}'")
 
-                # Генерируем ответ LLM
-                ai_response = await llm_service.generate_manager_response(full_history, manager_name="Алексей")
+                # --- 1. ПОДГОТОВКА КОНТЕКСТА ---
+                # Получаем текущую историю и добавляем к ней новые сообщения от клиента
+                current_history = db_service.get_dialog_history(db, dialog.chat_id)
+                for msg in pending_messages:
+                    current_history.append({"role": "user", "content": msg['content']})
 
-                # Отправляем ответ и сохраняем его в историю
-                if ai_response:
-                    success = wazzup_service.send_message(dialog.chat_id, ai_response)
+                # --- 2. ПОЛУЧЕНИЕ РЕШЕНИЯ ОТ LLM ---
+                prompt_library = prompt_service.get_prompt_library()
+                system_prompt = prompt_library.get("#ROLE_AND_STYLE#", "Ты - вежливый ассистент.")
+                
+                # Отправляем весь контекст "мозгу"
+                llm_decision = await llm_service.get_bot_decision(current_history, system_prompt)
+
+                if not llm_decision:
+                    print(f"❌ LLM не вернул решение для диалога {dialog.chat_id}. Пропускаем.")
+                    continue
+
+                # --- 3. РАЗБОР И ИСПОЛНЕНИЕ КОМАНД ---
+                response_text = llm_decision.get("response_text")
+                action = llm_decision.get("action")
+                action_params = llm_decision.get("action_params", {})
+                new_state = llm_decision.get("new_state", dialog.current_state)
+
+                # Получаем ID сделки и менеджера, сохраненные в диалоге
+                deal_id = dialog.deal_id
+                manager_id = dialog.manager_id
+
+                if not deal_id or not manager_id:
+                    print(f"КРИТИЧЕСКАЯ ОШИБКА: В диалоге {dialog.chat_id} отсутствуют deal_id или manager_id. Невозможно выполнить CRM-действие.")
+                    continue
+
+                # --- ШАГ 3.1: ОТПРАВКА СООБЩЕНИЯ КЛИЕНТУ ---
+                if response_text:
+                    success = wazzup_service.send_message(dialog.chat_id, response_text)
                     if success:
-                        db_service.add_message_to_history(db, dialog.chat_id, "assistant", ai_response)
-            db.close()
+                        # Добавляем ответ бота в историю для следующего шага
+                        current_history.append({"role": "assistant", "content": response_text})
+
+                # --- ШАГ 3.2: ВЫПОЛНЕНИЕ ДЕЙСТВИЙ В CRM ---
+                comment = action_params.get("comment_text")
+                task_subject = action_params.get("task_subject")
+                task_desc = action_params.get("task_description")
+
+                print(f"  - Действие для CRM: {action}")
+
+                if action == "LOG_COMMENT" and comment:
+                    bitrix_service.add_comment_to_deal(deal_id, f"[Чат-бот]: {comment}")
+                
+                elif action == "CREATE_TASK_AND_LOG":
+                    if comment: bitrix_service.add_comment_to_deal(deal_id, f"[Чат-бот]: {comment}")
+                    if task_desc and task_subject: 
+                        bitrix_service.create_activity_for_deal(deal_id, manager_id, task_subject, task_desc)
+
+                elif action == "ESCALATE_TO_MANAGER":
+                    reason = comment or "Причина эскалации не указана."
+                    bitrix_service.escalate_deal_to_manager(deal_id, manager_id, reason)
+
+                # --- 4. ОБНОВЛЕНИЕ ДИАЛОГА В БД ---
+                # Сохраняем новое состояние и всю обновленную историю
+                db_service.update_dialog(db, dialog.chat_id, new_state, current_history)
+                print(f"  - Диалог {dialog.chat_id} переведен в состояние '{new_state}'.")
+            
+            db.close() # Закрываем сессию после обработки всей пачки
         except Exception as e:
-            print(f"❌ ОШИБКА В ВОРКЕРЕ: {e}")
+            # Используем traceback для более детального логгирования ошибки
+            import traceback
+            print(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА В ВОРКЕРЕ: {e}")
+            traceback.print_exc()
+        
+        # Пауза перед следующей проверкой очереди
         await asyncio.sleep(5)
 
 # --- УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ ПРИЛОЖЕНИЯ ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("Приложение запускается...")
     worker_task = asyncio.create_task(process_pending_messages_worker())
     yield
+    print("Приложение останавливается...")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        print("Воркер успешно остановлен.")
 
-# --- ИСПРАВЛЕНИЕ ЗДЕСЬ: СНАЧАЛА СОЗДАЕМ APP, ПОТОМ ПЕРЕДАЕМ LIFESPAN ---
 app = FastAPI(title="Bitrix Wazzup Bot", lifespan=lifespan)
-# --------------------------------------------------------------------
 
 # --- ЗАВИСИМОСТЬ ДЛЯ ПОЛУЧЕНИЯ СЕССИИ БД ---
 def get_db():
@@ -76,6 +138,7 @@ def get_db():
 def read_root():
     return {"status": "ok", "message": "Bot is running"}
 
+# --- НОВЫЙ ОБРАБОТЧИК ВЕБХУКОВ BITRIX24 ---
 @app.post("/webhook/bitrix")
 async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db)):
     form_data = await request.form()
@@ -93,106 +156,97 @@ async def handle_bitrix_webhook(request: Request, db: Session = Depends(get_db))
     current_funnel_id = deal_details.get("CATEGORY_ID")
     current_stage = deal_details.get("STAGE_ID")
     
-    if current_funnel_id == TARGET_FUNNEL_ID:
-        print(f"Сделка {deal_id} в нужной воронке. Стадия: {current_stage}")
+    # --- 1. ПРОВЕРКА ТРИГГЕРА: Нужная воронка и нужная стадия ---
+    if str(current_funnel_id) == TARGET_FUNNEL_ID and current_stage == WELCOME_STAGE_ID:
+        print(f"✅✅✅ ТРИГГЕР СРАБОТАЛ: Сделка {deal_id} перешла на стадию '{WELCOME_STAGE_ID}' в воронке '{TARGET_FUNNEL_ID}'. Запускаем сценарий...")
 
-        if current_stage == NOMINALS_STAGE_ID:
-            print(f"⚠️ Сделка {deal_id} на стадии 'Номиналы'. Обработка прекращена.")
-            return {"status": "ok", "message": "Ignored due to Nominals stage"}
-
+        # --- 2. СБОР ДАННЫХ ---
         contact_id = int(deal_details.get("CONTACT_ID"))
         manager_id = int(deal_details.get("ASSIGNED_BY_ID"))
-        client_name, manager_name = "Уважаемый клиент", "Ваш менеджер"
-        contact_details = None
-
-        if contact_id:
-            contact_details = bitrix_service.get_contact_details(contact_id)
-            if contact_details and contact_details.get("NAME"):
-                client_name = contact_details.get("NAME")
-
-        if manager_id:
-            manager = bitrix_service.get_user_details(manager_id)
-            if manager:
-                full_name = f"{manager.get('NAME', '')} {manager.get('LAST_NAME', '')}".strip()
-                if full_name: manager_name = full_name
         
-        message_to_send = None
-        scenario_name = "Неизвестный"
+        contact_details = bitrix_service.get_contact_details(contact_id)
+        if not (contact_details and contact_details.get("PHONE")):
+            print(f"⚠️ ОСТАНОВКА: У контакта {contact_id} для сделки {deal_id} нет номера телефона.")
+            return {"status": "ok", "message": "Contact has no phone number"}
+        
+        client_name = contact_details.get("NAME", "Уважаемый клиент")
+        raw_phone = contact_details["PHONE"][0].get("VALUE")
+        client_phone = normalize_phone(raw_phone)
 
-        # --- РОУТЕР СЦЕНАРИЕВ ---
-        if current_stage == WELCOME_STAGE_ID:
-            scenario_name = "ПРИВЕТСТВИЕ"
-            message_to_send = (f"Здравствуйте, {client_name}! Это {manager_name}, ваш менеджер по сопровождению...")
-        elif current_stage == TOUCH_TODAY_STAGE_ID:
-            scenario_name = "КАСАНИЕ СЕГОДНЯ"
-            message_to_send = (f"Здравствуйте, {client_name}! Это {manager_name}. Как проходит работа по вашим текущим делам? ...")
-        elif current_stage == NEW_LOT_STAGE_ID:
-            scenario_name = "НОВЫЙ ЛОТ"
-            latest_activity = bitrix_service.get_latest_activity_for_deal(deal_id)
-            if latest_activity and latest_activity.get("DESCRIPTION"):
-                lot_description = latest_activity.get("DESCRIPTION")
-                message_to_send = (f"Здравствуйте, {client_name}! Это {manager_name}. У нас появились новые лоты по должнику: '{lot_description}'. ...")
-            else:
-                print(f"ОШИБКА СЦЕНАРИЯ: Сделка {deal_id} на стадии 'Новый лот', но нет дела с описанием.")
-        elif current_stage == TEST_ACTIVITY_STAGE_ID:
-            print(f"Тестовый триггер: Сделка {deal_id} перешла на стадию 'В ожидании'. Создаем дело...")
-            if manager_id:
-                subject = f"Тестовая задача от бота для сделки №{deal_id}"
-                description = "Это тестовое дело, созданное автоматически для проверки функции эскалации."
-                bitrix_service.create_activity_for_deal(deal_id=deal_id, responsible_id=manager_id, subject=subject, description=description)
-        elif current_stage == TEST_FULL_ACTION_STAGE_ID:
-            scenario_name = "КОМПЛЕКСНЫЙ ТЕСТ"
-            reason_for_escalation = "Клиент задал сложный вопрос о юридических аспектах."
-            print_formatted_message(scenario_name, deal_id, client_name, manager_name, "Запускаем проверку всех новых функций...")
-            bitrix_service.add_comment_to_deal(deal_id, f"Тестовый комментарий от бота. Триггер: {scenario_name}.")
-            if manager_id:
-                bitrix_service.escalate_deal_to_manager(deal_id, manager_id, reason_for_escalation)
+        manager = bitrix_service.get_user_details(manager_id)
+        manager_name = f"{manager.get('NAME', '')} {manager.get('LAST_NAME', '')}".strip() if manager else "Ваш менеджер"
+        
+        print(f"  - Клиент: {client_name} ({client_phone})")
+        print(f"  - Менеджер: {manager_name} ({manager_id})")
 
-        # --- ЕДИНЫЙ БЛОК ОТПРАВКИ СООБЩЕНИЯ И СОХРАНЕНИЯ В БД ---
-        if message_to_send:
-            print_formatted_message(scenario_name, deal_id, client_name, manager_name, message_to_send)
-            
-            if contact_details and contact_details.get("PHONE"):
-                phone_info = contact_details["PHONE"][0]
-                raw_phone_number = phone_info.get("VALUE")
-                phone_number = normalize_phone(raw_phone_number)
-                print(f"Найден и нормализован номер клиента: {phone_number}. Попытка отправки...")
-                success = wazzup_service.send_message(phone_number, message_to_send)
-                if success:
-                    db_service.add_message_to_history(db, phone_number, "assistant", message_to_send)
-            else:
-                print(f"⚠️ Не удалось отправить сообщение: у контакта для сделки {deal_id} не найден номер телефона.")
+        # --- 3. ЗАПУСК LLM ДЛЯ ИНИЦИАЦИИ ДИАЛОГА ---
+        # Создаем специальное системное сообщение для LLM, которое он поймет как команду "начать диалог"
+        initial_instruction = {
+            "role": "system",
+            "content": f"initiate_dialog. ИМЯ_КЛИЕНТА: {client_name}. ИМЯ_МЕНЕДЖЕРА: {manager_name}."
+        }
+        
+        prompt_library = prompt_service.get_prompt_library()
+        system_prompt = prompt_library.get("#ROLE_AND_STYLE#", "Ты - вежливый ассистент.")
+        
+        # Получаем первое решение от "мозга"
+        llm_decision = await llm_service.get_bot_decision([initial_instruction], system_prompt)
+
+        if not llm_decision:
+            print(f"❌ ОСТАНОВКА: LLM не вернул решение для инициации диалога по сделке {deal_id}.")
+            return {"status": "error", "message": "LLM failed to provide initial decision"}
+        
+        # --- 4. ИСПОЛНЕНИЕ КОМАНДЫ ОТ LLM ---
+        response_text = llm_decision.get("response_text")
+        action = llm_decision.get("action")
+        action_params = llm_decision.get("action_params", {})
+        new_state = llm_decision.get("new_state")
+        
+        # Отправляем первое сообщение клиенту
+        if response_text:
+            success = wazzup_service.send_message(client_phone, response_text)
+            if not success:
+                print(f"⚠️ Не удалось отправить приветственное сообщение для сделки {deal_id}.")
+                # Можно добавить комментарий в сделку об ошибке отправки
+                bitrix_service.add_comment_to_deal(deal_id, f"Ошибка! Не удалось отправить приветственное сообщение ботом на номер {client_phone}.")
+                return {"status": "ok", "message": "Wazzup send failed"}
+        
+        # Выполняем действие в CRM
+        if action == "LOG_COMMENT" and action_params.get("comment_text"):
+            bitrix_service.add_comment_to_deal(deal_id, action_params["comment_text"])
+
+        # --- 5. СОХРАНЕНИЕ РЕЗУЛЬТАТА В БД ---
+        # Создаем или обновляем диалог, привязывая его к сделке
+        dialog = db_service.get_or_create_dialog(db, client_phone, deal_id, manager_id, str(current_funnel_id))
+        
+        # Сохраняем новую историю (приветствие от бота) и новое состояние
+        new_history = []
+        if response_text:
+            new_history.append({"role": "assistant", "content": response_text})
+        
+        db_service.update_dialog(db, client_phone, new_state, new_history)
+
+        print(f"✅ Сценарий для сделки {deal_id} успешно запущен. Диалог переведен в состояние '{new_state}'.")
 
     return {"status": "ok", "message": "Webhook processed"}
 
-# --- ОБЛЕГЧЕННЫЙ ОБРАБОТЧИК ВЕБХУКОВ WAZZUP ---
+
+# --- ОБРАБОТЧИК WAZZUP (без изменений) ---
 @app.post("/webhook/wazzup")
 async def handle_wazzup_webhook(request: Request, db: Session = Depends(get_db)):
-    print(">>> Получен вебхук от Wazzup, добавляю в очередь...")
     data = await request.json()
-    
     if data.get("test") is True: return {"status": "ok"}
     if "messages" not in data or not data["messages"]: return {"status": "ok"}
     
-    first_message = data["messages"][0]
-    if first_message.get("isEcho") is True: 
-        print("   Это наше собственное 'эхо'-сообщение. Игнорируем.")
-        return {"status": "ok", "message": "Echo message ignored"}
+    message = data["messages"][0]
+    if message.get("isEcho"): return {"status": "ok"}
 
-    client_text = first_message.get("text")
-    raw_client_phone = first_message.get("chatId")
+    text = message.get("text")
+    chat_id = message.get("chatId")
     
-    if client_text and raw_client_phone:
-        client_phone = normalize_phone(raw_client_phone)
-        db_service.add_pending_message(db, client_phone, client_text)
+    if text and chat_id:
+        normalized_phone = normalize_phone(chat_id)
+        db_service.add_pending_message(db, normalized_phone, text)
+        print(f">>> Сообщение от {normalized_phone} добавлено в очередь.")
     
     return {"status": "ok"}
-
-def print_formatted_message(scenario: str, deal_id, client_name, manager_name, message: str):
-    print("="*50)
-    print(f"✅ СЦЕНАРИЙ '{scenario}' ДЛЯ СДЕЛКИ {deal_id}")
-    print(f"  - Клиент: {client_name}")
-    print(f"  - Менеджер: {manager_name}")
-    print("\n--- ГОТОВЫЙ ТЕКСТ ДЛЯ WAZZUP ---")
-    print(message)
-    print("="*50)

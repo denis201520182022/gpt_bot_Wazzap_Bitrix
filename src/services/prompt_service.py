@@ -5,12 +5,13 @@ import time
 import re
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from pathlib import Path
 
 # --- Настройки ---
 MAIN_DOC_ID = os.getenv("GOOGLE_DOC_ID", "1b_EfaKe-iqZG4beYI9lVrCwj2tOMDvK5WqaevJopXVM") 
 KNOWLEDGE_BASE_DOC_ID = os.getenv("KNOWLEDGE_BASE_DOC_ID", "1TE1PJWGfSFksvcuh1Nyova91BaeegRlUBmVVeBAZ8iw")
 SCOPES = ['https://www.googleapis.com/auth/documents.readonly']
-SERVICE_ACCOUNT_FILE = 'credentials.json'
+SERVICE_ACCOUNT_FILE = Path(__file__).parent.parent.parent / 'credentials.json'
 CACHE_TTL_SECONDS = 120
 
 _cached_prompt_library = None
